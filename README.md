@@ -1,6 +1,6 @@
 # INTRODUCTION
 
-scRNA-seq (Single-cell RNA sequencing) is a groundbreaking tool enabling researchers to delve deep into the transcriptomic profile of singular cells. This helps us derive putative cell types based on specific marker genes present within the data. The dataset we utilized is derived from the 2019 research paper titled ‘Adventitial Stromal Cells Define Group 2 Innate Lymphoid Cell Tissue Niches’ authored by Dahlgren, M.W. and team (DOI: 10.1016/j.immuni.2019.02.002).
+scRNA-seq (Single-cell RNA sequencing) is a groundbreaking tool enabling researchers to delve deep into the transcriptomic profile of singular cells. This helps us derive putative cell types based on specific marker genes present within the data. 
 
 The primary objective of the study revolved around deciphering the physical environment inhabited by type 2 lymphocytes.
 
