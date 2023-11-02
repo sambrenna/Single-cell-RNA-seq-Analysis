@@ -1,0 +1,432 @@
+---
+title: "Single-cell RNA-seq Analysis"
+date: "`r Sys.Date()`"
+author: "Tidjani Sabrina Anna"
+output: html_notebook
+---
+#Dependencies 
+```{r}
+library(Seurat)
+library(dplyr)
+library(Matrix)
+```
+
+```{r}
+devtools::install_github("thomasp85/patchwork")
+library(patchwork)
+```
+```{r}
+reticulate::py_install(packages ='umap-learn')
+```
+
+#Dataset Loading
+```{r}
+# Load the .sparse.RData count table as sm 
+load("SRA779509_SRS3805268.sparse.RData")
+# Check the first 10 gene names as example
+sm@Dimnames[[1]][1:4]
+```
+
+#Pre-processing
+
+After the check of gene names we noticed that it was given by genesymbol-genecodeID, thus, we processed them in order to keep only gene symbol
+```{r}
+# Pattern matching and selection of gene symbol
+newnames <- sub("(.*)_.*", "\\1", sm@Dimnames[[1]])
+
+# Names assignment
+sm@Dimnames[[1]] <- newnames
+
+# Check changes
+sm@Dimnames[[1]]
+```
+
+#Filtering the Data
+We initialized the Seurat object (non-normalized data) performing a filtering on the original table keeping only genes expressed in at least 3 cells and discarding a priori cells with less 200 genes expressed to exclude empty droplets or droplets containing a low-quality cell.
+Thresholds of the default initialization.
+```{r}
+bm <- CreateSeuratObject(counts = sm, project = "BoneMarrow")
+bm
+```
+
+
+```{r}
+bm <- CreateSeuratObject(counts = sm, project = "BoneMarrow", 
+                           min.cells = 3, min.features = 500)
+```
+
+```{r}
+bm
+```
+
+These are the first 6 barcodes (14 bases each)
+```{r}
+head(colnames(bm))
+```
+
+#Cell Quality Control
+We examine now the main quality control parameters we discussed during classes: - the number of unique genes detected in each cell: low-quality cells or empty droplets will often have very few genes - cell doublets or multiplets exhibit an aberrantly high gene count - similarly, the total number of molecules detected within a cell (correlates strongly with unique genes) - the percentage of reads that map to the mitochondrial genome: low-quality / dying cells often exhibit extensive mitochondrial contamination
+We can calculate mitochondrial QC metrics with the PercentageFeatureSet() function, which calculates the percentage of counts originating from a selected set of features (genes).
+
+```{r}
+#genes annotated on the mitochondrion
+grep("^MT-",rownames(bm),value = TRUE)
+```
+In scRNA-Seq count tables MT gene names start with “MT-” (do not forget the “-” symbol, there are nuclear genes with name starting with just MT without the dash!). 
+```{r}
+bm[["percent.mt"]] <- PercentageFeatureSet(bm, pattern = "^MT-")
+```
+
+We saw how ribosomal protein genes “eat up” a lot of reads because highly expressed. Their gene symbol usually starts by RPL or RPS:
+```{r}
+ grep("^RP[LS]",rownames(bm),value = TRUE)
+```
+```{r}
+  bm[["percent.rbp"]] <- PercentageFeatureSet(bm, pattern = "^RP[LS]")
+```
+The number of unique genes (called here features) and total molecules (reads after UMI filtering) are automatically calculated during CreateSeuratObject(). You can find them stored in the object meta data, together with the values we just computed:
+nCount_RNA: sum of the column (number of reads for each cell)
+nFeature_RNA: how many genes are found to be transcribed with at least one read in the given column
+percent.mt: percentage or reads falling on the mitochondria
+percent.rbp: percentage of reads coming from ribosomal transcripts
+```{r}
+ head(bm@meta.data, 5)
+
+```
+
+```{r}
+VlnPlot(bm, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"), ncol
+= 4)
+```
+
+```{r}
+ VlnPlot(bm, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"), ncol
+= 4, pt.size=0)
+```
+
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be
+#used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+#Number of reads per cell vs % of mt RNA
+plot1 <- FeatureScatter(bm, feature1 = "nCount_RNA", feature2 = "percent.mt")
+#Number of reads per cell vs how many reads we find transcribed per cell
+#Positive correlation: the more reads you find in a cell the more genes you find transcribed
+plot2 <- FeatureScatter(bm, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+
+```
+
+```{r}
+plot3 <- FeatureScatter(bm, feature1 = "nCount_RNA", feature2 = "percent.rbp")
+plot3
+```
+No correlation: if you have a lot of reads they are not gonna be eaten away by ribosomial proteins
+
+All in all the only visible correlation is between the number of reads and the number of genes detected. When they are too low, the droplet was empty. Too high, probably a doublet. On the basis of these plot, we have to decide thresholds for cell quality control.
+In the Seurat vignette, they employ:
+```{r}
+bm <- subset(bm, subset = nFeature_RNA > 500 & nFeature_RNA < 3000 & percent.mt < 8)
+```
+
+The thresholds are on the number of genes detected (between 500 and 3000), and on the MT DNA/RNA (8%)
+Let us see how many samples remain:
+
+```{r}
+bm
+```
+Normalizing the data
+10x data are usually just transformed into counts per million, or, to make them more readable, in counts x 10,000 reads. But, the final “expression estimate” it’s given by the log of the normalized counts
+```{r}
+bm <- NormalizeData(bm, normalization.method = "LogNormalize", scale.factor = 10000)
+
+```
+The original and normalized counts are buried inside the Seurat object bm. Let us find them:
+```{r}
+bm@assays
+bm@assays$RNA
+```
+
+Seurat contains a pre-computed list of cell cycle specific genes
+
+```{r}
+cc.genes.updated.2019
+```
+```{r}
+#Each cell is attributed to one of three cycle phases: G1 (non cycling), G2M or S (cycling)
+CellCycleScoring(bm, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = TRUE) -> bm
+
+bm[[]]
+```
+Each cell is a point in a n-dimensional space, where n is the number of genes considered. The closer two points, the more similar are the transcriptomes of the corresponding cells. However, the dimensions are too many for further processing. Also, most of the coordinates of each cell will be zero. So, the choice is to keep a subset of the genes, that is, those with the greatest variability of expression across cells.
+```{r}
+#the default method -vst- computes (or better, estimates) the mean-variance relationship o f each gene, and chooses the 2000 genes with hte highest variance.
+bm <- FindVariableFeatures(bm, selection.method = "vst", nfeatures = 2000)
+ # Identify the 10 most highly variable genes
+ top10 <- head(VariableFeatures(bm), 10)
+ # plot variable features with and without labels
+ plot1 <- VariableFeaturePlot(bm)
+ plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+ plot1 + plot2
+```
+
+But before proceeding another scaling of the counts is advised. The idea is to shift the expression of each gene, so that the mean expression across cells is 0 and the variance across cells is 1 This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate. In practice, values are sort of “binarized”, or rather “ternarized” - >0 “high expression”, 0 “average expression” <0 “under expression, or no expression at all”. Notice that this is done for all the genes.
+```{r}
+all.genes <- rownames(bm)
+bm <- ScaleData(bm, features = all.genes)
+```
+Since mean/variance are computed across all cells and genes, we can remove the unwanted effects at this step:
+```{r}
+ #remove the cell cycle effect
+ #pbmc <- ScaleData(pbmc, vars.to.regress = c("S.Score", "G2M.Score"), features = all.genes)
+ #remove the bias due to the % of mt RNA - not necessary dato il violin plot
+ #pbmc <- ScaleData(pbmc, vars.to.regress = "percent.mt", features = all.genes)
+```
+
+#Dimensionality reduction
+The recommended method for 10x data is PCA. Notice that it is performed on the “variable features” (the 2000 most variable genes).
+
+```{r}
+bm <- RunPCA(bm, features = VariableFeatures(object = bm))
+# Examine and visualize PCA results a few different ways
+print(bm[["pca"]], dims = 1:5, nfeatures = 5)
+
+```
+These are the genes making a difference (highest variance) in each component
+
+```{r}
+VizDimLoadings(bm, dims = 1, reduction = "pca", nfeatures = 10)
+VizDimLoadings(bm, dims = 2:5, reduction = "pca", nfeatures = 10)
+
+```
+And the projection of the cells in the first two principal components:
+```{r}
+ DimPlot(bm, reduction = "pca")
+
+```
+Notice that the cells were colored according to the CC phase. They don’t seem to group according to the cell cycle phase.
+```{r}
+#with ndims we can choose how many PC to plot
+ ElbowPlot(bm, ndims=50)
+```
+
+#Clustering
+Seurat first constructs a KNN graph based on the euclidean distance in PCA space, and refines the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the FindNeighbors() function, and takes as input the previously defined dimensionality of the dataset.
+```{r}
+bm20 <- FindNeighbors(bm, dims = 1:20)
+bm15 <- FindNeighbors(bm, dims = 1:15)
+```
+To cluster the cells, modularity optimization techniques such as the Louvain algorithm (default) are applied to iteratively group cells together, with the goal of optimizing the standard modularity function.
+The FindClusters() function implements this procedure, and contains a resolution parameter that sets the ‘granularity’ of the downstream clustering, with increased values leading to a greater number of clusters. This parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets.
+
+```{r}
+bm20_04 <- FindClusters(bm20, resolution = 0.4)
+bm15_04 <- FindClusters(bm15, resolution = 0.4)
+
+bm20_06 <- FindClusters(bm20, resolution = 0.6)
+bm15_06 <- FindClusters(bm15, resolution = 0.6)
+
+bm20_08 <- FindClusters(bm20, resolution = 0.8)
+bm15_08 <- FindClusters(bm15, resolution = 0.8)
+
+```
+```{r}
+library(cluster)
+
+# Define a function to calculate silhouette scores and add them to the Seurat object metadata
+add_silhouette <- function(object) {
+  # Calculate the distance matrix
+  dist.matrix <- dist(x = Embeddings(object)[, 1:2])
+  # Get the cluster assignments
+  clusters <- as.numeric(as.factor(Idents(object)))
+  # Calculate the silhouette scores
+  sil <- silhouette(x = clusters, dist = dist.matrix)
+  # Add the silhouette scores as a new column in the metadata
+  object@meta.data$sil <- sil[, 3]
+  return(object)
+}
+
+# Apply the function to each Seurat object
+bm20_04 <- add_silhouette(FindClusters(bm20, resolution = 0.4))
+bm15_04 <- add_silhouette(FindClusters(bm15, resolution = 0.4))
+bm20_06 <- add_silhouette(FindClusters(bm20, resolution = 0.6))
+bm15_06 <- add_silhouette(FindClusters(bm15, resolution = 0.6))
+bm20_08 <- add_silhouette(FindClusters(bm20, resolution = 0.8))
+bm15_08 <- add_silhouette(FindClusters(bm15, resolution = 0.8))
+
+```
+```{r}
+library(ggplot2)
+
+# Combine the Seurat objects into a single data frame
+all_data <- rbind(
+  data.frame(cluster = "bm20_04", silhouette = bm20_04@meta.data$sil),
+  data.frame(cluster = "bm15_04", silhouette = bm15_04@meta.data$sil),
+  data.frame(cluster = "bm20_06", silhouette = bm20_06@meta.data$sil),
+  data.frame(cluster = "bm15_06", silhouette = bm15_06@meta.data$sil),
+  data.frame(cluster = "bm20_08", silhouette = bm20_08@meta.data$sil),
+  data.frame(cluster = "bm15_08", silhouette = bm15_08@meta.data$sil)
+
+)
+
+# Plot the silhouette scores as a violin plot
+ggplot(all_data, aes(x = cluster, y = silhouette)) +
+  geom_violin(fill = "grey") +
+  labs(x = "Clustering solution", y = "Silhouette score") +
+  theme_classic()
+```
+
+```{r}
+# Get the number of cells in each cluster for each Seurat object
+table(bm20_06@meta.data$seurat_clusters)
+table(bm15_04@meta.data$seurat_clusters)
+
+```
+
+
+Look at cluster IDs of the first 10 cells
+```{r}
+head(Idents(bm20_06), 10)
+head(Idents(bm15_04), 10)
+```
+
+```{r}
+head(bm20_06[[]],10)
+head(bm15_04[[]],10)
+```
+
+We can plot them in the space of the first two PCA components
+```{r}
+ DimPlot(bm20_06, reduction = "pca")
+ DimPlot(bm15_04, reduction = "pca")
+```
+But we know that for visualization and 2D plotting there are better strategies. t_SNE, always on the dimension chosen for the clustering:
+```{r}
+bm20_tnse <- RunTSNE(bm20_06, dims=1:20)
+DimPlot(bm20_tnse, reduction = "tsne")
+```
+
+```{r}
+bm15_tnse <- RunTSNE(bm15_04, dims=1:15)
+DimPlot(bm15_tnse, reduction = "tsne")
+```
+ 
+Or UMAP
+```{r}
+bm20_umap <- RunUMAP(bm20_06, dims = 1:20)
+DimPlot(bm20_umap, reduction = "umap")
+```
+
+```{r}
+bm15_umap <- RunUMAP(bm15_04, dims=1:15)
+DimPlot(bm15_umap, reduction = "umap")
+```
+
+We can also check whether some of the critical quality parameters influenced the clustering we got:
+```{r}
+ VlnPlot(bm15_04,features="nCount_RNA")
+```
+
+```{r}
+ VlnPlot(bm15_04,features="nFeature_RNA")
+```
+
+```{r}
+ VlnPlot(bm15_04,features="percent.mt")
+```
+
+```{r}
+ VlnPlot(bm15_04,features="percent.rbp")
+```
+
+Or the cell cycle:
+```{r}
+library(ggplot2) 
+bm@meta.data %>%
+   group_by(seurat_clusters,Phase) %>%
+   count() %>%
+   group_by(seurat_clusters) %>%
+   mutate(percent=100*n/sum(n)) %>%
+   ungroup() %>%
+   ggplot(aes(x=seurat_clusters,y=percent, fill=Phase)) +
+   geom_col() +
+   ggtitle("Percentage of cell cycle phases per cluster")
+
+```
+Finding “marker” genes and assigning cell types to clusters
+Seurat includes a function that can be used to find genes a) over expressed between two clusters or b) overexpressed in one clusters with respect to all the others. The function permits to employ different tests, including those used for bulk RNA-Seq. For 10x data, the choice is to employ a non parametric test (once again, the Wilcoxon test!) which is the default. Notice also another parameter (min.pct): it means that a gene has to be expressed in at least 25% of the cells of the cluster.
+```{r}
+cluster2.markers <- FindMarkers(bm20_06, ident.1 = 2, min.pct = 0.25, test.use = "wilcox")
+head(cluster2.markers, n = 5)
+```
+fold change: average expression of a cluster/average expression of all the other cells not belonging to the cluster
+pct.1 percentage of cells expressing the gene in the cluster
+pct.2 percentage of cells non belonging to the cluster expressing the gene
+A gene to be a marker gene must be expressed in at least 25% of the cells in the cluster
+The one vs. all analysis can be iterated automatically:
+```{r}
+bm.markers <- FindAllMarkers(bm15_04, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+```
+
+And we can output the top n (in this case 5) genes for each cluster. Notice that here they are sorted by logFC - more informative than “p_val_adj”, since a lot of genes will have a FDR close to zero with smallest changes. 
+```{r}
+bm.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 10, order_by = avg_log2FC)
+```
+
+
+we can plot their expression with a heatmap:
+```{r}
+
+ FeaturePlot(bm15_tnse, features = c("CD3E", "IL7R", "MS4A1", "LYZ", "NKG7", "HBA1", "PRTN3","HBM","IGLL1","AIF1","IGHG3", "IRF7"))
+```
+
+Or in single cells grouped by cluster:
+```{r}
+ bm.markers %>%
+     group_by(cluster) %>%
+     top_n(n = 10, wt = avg_log2FC) -> top10
+ DoHeatmap(bm15_04, features = top10$gene) + NoLegend()
+```
+
+```{r}
+ cluster0.markers <- FindMarkers(bm15_04, ident.1 = 0, min.pct = 0.25, test.use = "wilcox")
+ cluster0.markers <- cluster0.markers[order(-cluster0.markers$avg_log2FC),]
+ head(cluster0.markers, n = 10)
+```
+
+```{r}
+cluster1.markers <- FindMarkers(bm15_08, ident.1 = 1, min.pct = 0.25, test.use = "wilcox")
+ cluster1.markers <- cluster1.markers[order(-cluster2.markers$avg_log2FC),]
+ head(cluster1.markers, n = 10)
+```
+
+```{r}
+cluster0AND1.markers <- FindMarkers(bm15_04, ident.1 = c(0,2), min.pct = 0.25, test.use = "wilcox")
+cluster0AND1.markers <- cluster0AND1.markers[order(-cluster0AND1.markers$avg_log2FC),]
+head(cluster0AND1.markers, n = 10)
+```
+
+```{r}
+ cluster10.markers <- FindMarkers(bm15_04, ident.1 = 2, ident.2 = 0, min.pct = 0.25, test.use= "wilcox")
+ cluster10.markers <- cluster10.markers[order(-cluster10.markers$avg_log2FC),]
+ head(cluster10.markers, n = 10)
+```
+
+
+
+```{r}
+ DotPlot(bm15_04, features = c("CD3E", "IL7R", "MS4A1", "LYZ", "NKG7", "HBA1", "PRTN3","HBM","IGLL1","AIF1","IGHG3", "IRF7"))
+
+```
+```{r}
+bm15_04 <- RunTSNE(bm15_04)
+new.cluster.ids <- c("Naive CD4 T", "Memory CD4 T", "B", "CD14 Monocytes", "NK", "Erythroid-like", "Monocytes", "Erythroid-like2","Dendritic 1", "Dendritic 2", "Plasma cells", "Plasmacytoid dendritic cells")
+names(new.cluster.ids) <- levels(bm15_04)
+bm15_tnse_1 <- RenameIdents(bm15_04, new.cluster.ids)
+DimPlot(bm15_tnse_1, reduction = "tsne", label = TRUE, pt.size = 0.5) + NoLegend()
+```
